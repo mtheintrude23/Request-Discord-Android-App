@@ -259,7 +259,9 @@ object DiscordHttpClient {
                 val progressObj = userStatus?.optJSONObject("progress")
                 if (progressObj != null && taskKey.isNotEmpty()) {
                     val taskProgress = progressObj.optJSONObject(taskKey)
-                    progress = taskProgress?.optInt("value") ?: 0
+                        ?: progressObj.optJSONObject("WATCH_VIDEO")
+                        ?: progressObj.optJSONObject("WATCH_VIDEO_ON_MOBILE")
+                    progress = taskProgress?.optDouble("value")?.toInt() ?: 0
                 }
                 if (progress == 0 && userStatus != null) {
                     progress = if (userStatus.has("stream_progress_seconds")) {
