@@ -216,11 +216,12 @@ object DiscordHttpClient {
                         val matchType = when {
                             upperK.contains("PLAY") -> "GAME"
                             upperK.contains("STREAM") -> "STREAM"
-                            upperK.contains("VIDEO") -> "WATCH_VIDEO"
+                            upperK.contains("WATCH_VIDEO") || upperK.contains("VIDEO") -> "WATCH_VIDEO" 
                             upperK.contains("ACHIEVEMENT_IN_ACTIVITY") -> "ACHIEVEMENT"
                             upperK.contains("ACTIVITY") -> "ACTIVITY"
                             else -> null
                         }
+
                         if (matchType != null) {
                             detectedType = matchType
                             taskKey = k
