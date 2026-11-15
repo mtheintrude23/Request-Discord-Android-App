@@ -144,15 +144,15 @@ class DiscordQuestService : Service() {
     }
 
     // Toggle Quest Selection Checkbox
-    fun toggleQuestSelection(questId: String) {
+    fun toggleQuestSelectionInstance(questId: String) {
         Companion.toggleQuestSelection(questId)
     }
 
-    fun selectAllQuests(quests: List<DiscordQuest>) {
+    fun selectAllQuestsInstance(quests: List<DiscordQuest>) {
         Companion.selectAllQuests(quests)
     }
 
-    fun deselectAllQuests() {
+    fun deselectAllQuestsInstance() {
         Companion.deselectAllQuests()
     }
 
@@ -363,70 +363,81 @@ class DiscordQuestService : Service() {
         }
     }
 
-    private suspend fun triggerClaimIfNeeded(token: String, quest: DiscordQuest) {
-        log("Completed task. Ready to claim reward \"${quest.rewardName}\"!", "success")
-        
-        val account = db.discordAccountDao().getAccount()
-        if (account != null) {
-            log("Submitting claim reward API payload for \"${quest.rewardName}\"...", "info")
-            val res = withContext(Dispatchers.IO) {
-                DiscordHttpClient.claimReward(token, quest.id)
-            }
+    private suspend fun processHeartbeatQuest(
+        token: String,
+        quest: DiscordQuest,
+        streamChannel: String
+    ) {
+        val streamKey = "call:$streamChannel:${Random.nextInt(1000, 9999)}"
+        log("Pre-starting game emulator for \"${quest.name}\" using key: $streamKey...", "info")
 
-            if (res.isSuccessful) {
-                log("Reward \"${quest.rewardName}\" has been claimed successfully!", "success")
-                updateQuestProgressInList(quest.id, true, quest.target, true, true)
-            } else if (res.code == 400 || res.code == 403) {
-                log("Auto-Claim requires visual user interaction (e.g., Catpcha required inside Discord). Please open the Quest section in your Discord app to complete the claim.", "warn")
-                updateQuestProgressInList(quest.id, true, quest.target, true, false)
-            } else {
-                log("Claim reward API returned warning: Code ${res.code}.", "warn")
-                updateQuestProgressInList(quest.id, true, quest.target, true, false)
-            }
-        }
-    }
+        var currentProgressSecs = quest.currentProgress
+        val targetSecs = quest.target
+        var failuresCount = 0
 
-
-    /**
-     * Video quests are monitored read-only.
-     * Discord reports authoritative progress through GET /quests/@me.
-     * No fabricated timestamps or video-progress submissions are sent here.
-     */
-    private suspend fun processVideoQuest(token: String, quest: DiscordQuest) {
-        val targetSecs = quest.target.coerceAtLeast(0)
-        var currentProgressSecs = quest.currentProgress.coerceAtLeast(0)
-        val speed = 7 // Tốc độ tua (giây mỗi lần gửi request)
-
-        log("Bắt đầu tự động spoof video cho \"${quest.name}\" (${currentProgressSecs}/${targetSecs}s)...", "info")
-
-        if (targetSecs == 0) {
-            log("Video Quest \"${quest.name}\": Discord không trả về thời lượng mục tiêu.", "warn")
-            return
+        withContext(Dispatchers.IO) {
+            DiscordHttpClient.sendHeartbeat(token, quest.id, streamKey, false)
         }
 
         while (currentProgressSecs < targetSecs && _isExecuting.value) {
-            val remaining = minOf(speed, targetSecs - currentProgressSecs)
-            delay(remaining * 1000L)
+            val delaySeconds = Random.nextInt(19, 22)
+            log("Heartbeating simulator... waiting ${delaySeconds}s (Progress: $currentProgressSecs/${quest.target}s)...", "debug")
+            delay(delaySeconds * 1000L)
 
-            val timestamp = currentProgressSecs + speed
-        // Gọi API POST video-progress đã có sẵn trong DiscordHttpClient
             val res = withContext(Dispatchers.IO) {
-                DiscordHttpClient.sendVideoProgress(token, quest.id, minOf(targetSecs, timestamp).toDouble())
+                DiscordHttpClient.sendHeartbeat(token, quest.id, streamKey, false)
             }
 
             if (res.isSuccessful) {
-                currentProgressSecs = minOf(targetSecs, timestamp)
-                val percent = ((currentProgressSecs.toDouble() / targetSecs) * 100.0).toInt().coerceIn(0, 100)
-                log("Video Quest \"${quest.name}\": ${currentProgressSecs}/${targetSecs}s (${percent}%)", "progress")
+                failuresCount = 0
+                val parsedObj = try {
+                    JSONObject(res.body)
+                } catch (e: Exception) {
+                    null
+                }
+                
+                val serverProgress = if (parsedObj != null) {
+                    val progressObj = parsedObj.optJSONObject("progress")
+                    
+                    val taskDef = progressObj?.optJSONObject(quest.taskKeyName)
+                        ?: progressObj?.optJSONObject("PLAY_ON_DESKTOP")
+                        ?: progressObj?.optJSONObject("STREAM_ON_DESKTOP")
+                        ?: progressObj?.optJSONObject("PLAY_ACTIVITY")
+                        ?: progressObj?.optJSONObject("WATCH_VIDEO")
+                        ?: progressObj?.optJSONObject("WATCH_VIDEO_ON_MOBILE")
+                        
+                    taskDef?.optInt("value") ?: (currentProgressSecs + delaySeconds)
+                } else {
+                    currentProgressSecs + delaySeconds
+                }
+
+                currentProgressSecs = if (serverProgress > currentProgressSecs) serverProgress else currentProgressSecs + delaySeconds
+                if (currentProgressSecs > targetSecs) {
+                    currentProgressSecs = targetSecs
+                }
+
                 updateQuestProgressInList(quest.id, true, currentProgressSecs, currentProgressSecs >= targetSecs)
+            } else if (res.isRateLimit) {
+                failuresCount++
+                val s = res.retryAfterSeconds ?: 10
+                log("Rate Limit Hit during heartbeat! Blocked for $s seconds.", "warn")
+                delay((s + 1) * 1000)
             } else {
-                log("Gửi tiến trình video thất bại: HTTP ${res.code}. Thử lại sau...", "warn")
-                delay(5000)
+                failuresCount++
+                log("Heartbeat failed with warning: HTTP Code ${res.code}.", "warn")
+                if (failuresCount > 4) {
+                    log("Aborted heartbeat task: API rejected session multiple times.", "err")
+                    break
+                }
             }
         }
 
+        withContext(Dispatchers.IO) {
+            DiscordHttpClient.sendHeartbeat(token, quest.id, streamKey, true)
+        }
+
         if (currentProgressSecs >= targetSecs && _isExecuting.value) {
-            log("Video Quest \"${quest.name}\" đã hoàn thành! Đang tiến hành nhận thưởng...", "success")
+            log("Game/Stream Quest \"${quest.name}\" Completed!", "success")
             triggerClaimIfNeeded(token, quest)
         }
     }
