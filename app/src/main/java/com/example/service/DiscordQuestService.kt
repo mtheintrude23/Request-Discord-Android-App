@@ -290,13 +290,13 @@ class DiscordQuestService : Service() {
 
                             if (!isEnrolled) {
                                 log("Skipped: Quest must be accepted / enrolled first before progress can be simulated.", "warn")
-                                // update quest status in state
                                 updateQuestProgressInList(quest.id, enrolled = false, completed = false)
                                 return@launch
                             }
 
-                            // Process Quest Types
-                            if (quest.type == "WATCH_VIDEO") {
+                            // Process Quest Types (Hỗ trợ cả WATCH_VIDEO và WATCH_VIDEO_ON_MOBILE)
+                            val supportedVideoTasks = listOf("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE")
+                            if (quest.type == "WATCH_VIDEO" || supportedVideoTasks.contains(quest.taskKeyName)) {
                                 processVideoQuest(token, quest)
                             } else {
                                 // Game, Stream, Activity, Achievement
@@ -323,6 +323,69 @@ class DiscordQuestService : Service() {
             }
         }
     }
+
+    private suspend fun processVideoQuest(token: String, quest: DiscordQuest) {
+        val targetSecs = quest.target.coerceAtLeast(0)
+        var currentProgressSecs = quest.currentProgress.coerceAtLeast(0)
+        val speed = 7 // Tốc độ tua (giây mỗi lần gửi request)
+
+        log("Bắt đầu tự động spoof video cho \"${quest.name}\" (${currentProgressSecs}/${targetSecs}s)...", "info")
+
+        if (targetSecs == 0) {
+            log("Video Quest \"${quest.name}\": Discord không trả về thời lượng mục tiêu.", "warn")
+            return
+        }
+
+        while (currentProgressSecs < targetSecs && _isExecuting.value) {
+            val remaining = minOf(speed, targetSecs - currentProgressSecs)
+            delay(remaining * 1000L)
+
+            val timestamp = currentProgressSecs + speed
+            // Gọi API POST video-progress đã có sẵn trong DiscordHttpClient
+            val res = withContext(Dispatchers.IO) {
+                DiscordHttpClient.sendVideoProgress(token, quest.id, minOf(targetSecs, timestamp).toDouble())
+            }
+
+            if (res.isSuccessful) {
+                currentProgressSecs = minOf(targetSecs, timestamp)
+                val percent = ((currentProgressSecs.toDouble() / targetSecs) * 100.0).toInt().coerceIn(0, 100)
+                log("Video Quest \"${quest.name}\": ${currentProgressSecs}/${targetSecs}s (${percent}%)", "progress")
+                updateQuestProgressInList(quest.id, true, currentProgressSecs, currentProgressSecs >= targetSecs)
+            } else {
+                log("Gửi tiến trình video thất bại: HTTP ${res.code}. Thử lại sau...", "warn")
+                delay(5000)
+            }
+        }
+
+        if (currentProgressSecs >= targetSecs && _isExecuting.value) {
+            log("Video Quest \"${quest.name}\" đã hoàn thành! Đang tiến hành nhận thưởng...", "success")
+            triggerClaimIfNeeded(token, quest)
+        }
+    }
+
+    private suspend fun triggerClaimIfNeeded(token: String, quest: DiscordQuest) {
+        log("Completed task. Ready to claim reward \"${quest.rewardName}\"!", "success")
+        
+        val account = db.discordAccountDao().getAccount()
+        if (account != null) {
+            log("Submitting claim reward API payload for \"${quest.rewardName}\"...", "info")
+            val res = withContext(Dispatchers.IO) {
+                DiscordHttpClient.claimReward(token, quest.id)
+            }
+
+            if (res.isSuccessful) {
+                log("Reward \"${quest.rewardName}\" has been claimed successfully!", "success")
+                updateQuestProgressInList(quest.id, true, quest.target, true, true)
+            } else if (res.code == 400 || res.code == 403) {
+                log("Auto-Claim requires visual user interaction (e.g., Catpcha required inside Discord). Please open the Quest section in your Discord app to complete the claim.", "warn")
+                updateQuestProgressInList(quest.id, true, quest.target, true, false)
+            } else {
+                log("Claim reward API returned warning: Code ${res.code}.", "warn")
+                updateQuestProgressInList(quest.id, true, quest.target, true, false)
+            }
+        }
+    }
+
 
     /**
      * Video quests are monitored read-only.
